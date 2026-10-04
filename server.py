@@ -22,6 +22,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 from xml.sax.saxutils import escape as xml_escape
+from collections.abc import Iterator, Mapping
+
+try:
+    import turso_serverless
+except ImportError:  # Local SQLite still works without the optional Vercel driver.
+    turso_serverless = None
 
 
 ROOT = Path(__file__).resolve().parent
@@ -47,19 +53,81 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def connect() -> sqlite3.Connection:
+class DatabaseRow(Mapping):
+    """SQLite-style row supporting integer and column-name access."""
+
+    def __init__(self, cursor, row):
+        self._values = tuple(row)
+        self._keys = tuple(column[0] for column in (cursor.description or ()))
+        self._by_name = dict(zip(self._keys, self._values))
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        return self._by_name[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._keys)
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+
+def make_row(cursor, row) -> DatabaseRow:
+    return DatabaseRow(cursor, row)
+
+
+DB_ERRORS = (sqlite3.Error,) + ((turso_serverless.Error,) if turso_serverless else ())
+DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError,) + ((turso_serverless.IntegrityError,) if turso_serverless else ())
+
+
+class ClosingConnection:
+    """Preserve DB-API context behavior and close remote HTTP sessions."""
+
+    def __init__(self, connection):
+        self._connection = connection
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+    def __enter__(self):
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return self._connection.__exit__(exc_type, exc_value, traceback)
+        finally:
+            self._connection.close()
+
+
+def connect():
+    database_url = os.environ.get("TURSO_DATABASE_URL", "").strip()
+    database_token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+    if database_url or database_token:
+        if not (database_url and database_token):
+            raise sqlite3.OperationalError("Both Turso database settings must be configured.")
+        if turso_serverless is None:
+            raise sqlite3.OperationalError("The remote database driver is not installed.")
+        conn = turso_serverless.connect(database_url, auth_token=database_token)
+        conn.row_factory = make_row
+        conn.execute("PRAGMA foreign_keys=ON")
+        return ClosingConnection(conn)
+    if os.environ.get("VERCEL") == "1":
+        raise sqlite3.OperationalError("Add TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in Vercel project settings.")
     conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
+    conn.row_factory = make_row
     conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    return ClosingConnection(conn)
 
 
 def init_db() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    remote_database = bool(os.environ.get("TURSO_DATABASE_URL") and os.environ.get("TURSO_AUTH_TOKEN"))
+    if not remote_database and os.environ.get("VERCEL") != "1":
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     with connect() as db:
         db.executescript("""
-            PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS admins (
               username TEXT PRIMARY KEY, salt TEXT NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL
             );
@@ -123,7 +191,7 @@ def init_db() -> None:
             ]
             for name, category, desc, mrp, price, cost, images, variants, specs, feat, best, rating, reviews in demo_products:
                 slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-                db.execute("""INSERT INTO products(slug,name,category,description,mrp,price,supplier_cost,images,variants,specs,stock_status,cod,featured,bestseller,active,rating,reviews,is_demo,created_at)
+                db.execute("""INSERT OR IGNORE INTO products(slug,name,category,description,mrp,price,supplier_cost,images,variants,specs,stock_status,cod,featured,bestseller,active,rating,reviews,is_demo,created_at)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,1,?)""", (slug, name, category, desc, mrp, price, cost, json.dumps(images), json.dumps(variants), json.dumps(specs), "in_stock", 1, feat, best, 0, 0, utc_now()))
         # The shop owner's first supplied item is real catalogue content, not a demo.
         rack_images = ["/uploads/shoe-rack-main.webp", "/uploads/shoe-rack-details.webp", "/uploads/shoe-rack-before-after.webp"]
@@ -172,7 +240,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-        self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data: https://images.unsplash.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data: https://images.unsplash.com https://*.public.blob.vercel-storage.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'")
         self.send_header("Cache-Control", "no-store")
 
     def json(self, payload, status: int = 200, extra_headers: dict[str, str] | None = None) -> None:
@@ -252,6 +320,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/admin/session":
                 sess = self.session()
                 self.json({"authenticated": bool(sess), "csrf": sess["csrf"] if sess else ""}); return
+            if path == "/api/admin/setup-status":
+                with connect() as db:
+                    has_admin = db.execute("SELECT COUNT(*) FROM admins").fetchone()[0] > 0
+                self.json({"complete": has_admin, "enabled": bool(os.environ.get("AMORA_ADMIN_SETUP_TOKEN")) and not has_admin}); return
             if path == "/api/admin/dashboard":
                 if not self.admin(): return
                 with connect() as db:
@@ -296,7 +368,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.json({"days": by_day}); return
             if path.startswith("/api/order/"):
                 order_id = path.rsplit("/", 1)[-1]
-                token = query.get("token", [""])[0]
+                authorization = self.headers.get("Authorization", "")
+                token = authorization[7:] if authorization.lower().startswith("bearer ") else query.get("token", [""])[0]
                 if len(token) < 30:
                     self.fail("Order not found.", 404); return
                 with connect() as db:
@@ -326,7 +399,7 @@ class Handler(BaseHTTPRequestHandler):
                     else: self.fail("Product not found.", 404)
                 return
             self.serve_file(path)
-        except sqlite3.Error:
+        except DB_ERRORS:
             self.fail("The store database is temporarily unavailable.", 500)
 
     def product_record(self, row: sqlite3.Row) -> dict:
@@ -372,8 +445,10 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
         allowed_root = ROOT
-        if url_path in ("/", "/admin", "/admin/", "/shop", "/cart", "/checkout", "/orders", "/track", "/privacy", "/terms", "/shipping", "/returns", "/contact") or url_path.startswith("/product/") or url_path.startswith("/track/") or url_path.startswith("/category/"):
-            target = ROOT / "index.html"
+        if url_path == "/admin/setup":
+            target = ROOT / "admin-setup.html"
+        elif url_path in ("/", "/admin", "/admin/", "/shop", "/cart", "/checkout", "/orders", "/track", "/privacy", "/terms", "/shipping", "/returns", "/contact") or url_path.startswith("/product/") or url_path.startswith("/track/") or url_path.startswith("/category/"):
+            target = ROOT / "public" / "index.html"
         elif url_path.startswith("/assets/"):
             allowed_root = ROOT / "assets"
             target = allowed_root / url_path.removeprefix("/assets/")
@@ -382,8 +457,19 @@ class Handler(BaseHTTPRequestHandler):
             target = allowed_root / url_path.removeprefix("/uploads/")
         elif url_path == "/robots.txt":
             target = ROOT / "robots.txt"
+        elif url_path == "/404.html":
+            target = ROOT / "public" / "404.html"
         else:
-            self.fail("Page not found.", 404); return
+            try:
+                payload = (ROOT / "public" / "404.html").read_bytes()
+            except (FileNotFoundError, PermissionError):
+                self.fail("Page not found.", 404); return
+            self.send_response(404)
+            self._headers("text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         try:
             target = target.resolve(strict=True)
             if not target.is_relative_to(allowed_root) or not target.is_file():
@@ -428,8 +514,27 @@ class Handler(BaseHTTPRequestHandler):
                 expires = time.time() + SESSION_HOURS * 3600
                 with connect() as db:
                     db.execute("INSERT INTO sessions(token_hash,csrf,expires_at,created_at) VALUES(?,?,?,?)", (hashlib.sha256(raw.encode()).hexdigest(), csrf, expires, utc_now()))
-                secure = "; Secure" if os.environ.get("AMORA_COOKIE_SECURE") == "1" else ""
+                secure = "; Secure" if os.environ.get("AMORA_COOKIE_SECURE") == "1" or os.environ.get("VERCEL") == "1" else ""
                 self.json({"authenticated": True, "csrf": csrf}, extra_headers={"Set-Cookie": f"amora_admin={raw}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_HOURS*3600}{secure}"}); return
+            if path == "/api/admin/setup":
+                setup_token = os.environ.get("AMORA_ADMIN_SETUP_TOKEN", "")
+                supplied_token = str(data.get("setup_token", ""))[:300]
+                username = str(data.get("username", "")).strip()[:120]
+                password = str(data.get("password", ""))[:200]
+                if len(setup_token) < 32:
+                    self.fail("First-time admin setup is not enabled. Ask the site owner to configure it in Vercel.", 503); return
+                if len(supplied_token) < 32 or not hmac.compare_digest(setup_token, supplied_token):
+                    self.fail("That setup code is not correct.", 401); return
+                if not username or len(password) < 12:
+                    self.fail("Enter a username and a password with at least 12 characters."); return
+                with connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    if db.execute("SELECT COUNT(*) FROM admins").fetchone()[0]:
+                        self.fail("Admin setup is already complete. Sign in at /admin.", 409); return
+                    salt = secrets.token_bytes(16)
+                    password_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PASSWORD_ROUNDS).hex()
+                    db.execute("INSERT INTO admins(username,salt,password_hash,created_at) VALUES(?,?,?,?)", (username, salt.hex(), password_hash, utc_now()))
+                self.json({"ok": True}); return
             if path == "/api/admin/logout":
                 sess = self.session(require_csrf=True)
                 if not sess: return
@@ -466,9 +571,9 @@ class Handler(BaseHTTPRequestHandler):
             self.fail("Endpoint not found.", 404)
         except ValueError as exc:
             self.fail(str(exc) or "Please check your information.")
-        except sqlite3.IntegrityError:
+        except DB_INTEGRITY_ERRORS:
             self.fail("We could not save that record. Please check the details and try again.")
-        except sqlite3.Error:
+        except DB_ERRORS:
             self.fail("The store database is temporarily unavailable.", 500)
 
     def do_PUT(self):
@@ -498,9 +603,9 @@ class Handler(BaseHTTPRequestHandler):
             self.fail("Endpoint not found.", 404)
         except ValueError as exc:
             self.fail(str(exc) or "Please check your information.")
-        except sqlite3.IntegrityError:
+        except DB_INTEGRITY_ERRORS:
             self.fail("That name is already in use. Please choose another.")
-        except sqlite3.Error:
+        except DB_ERRORS:
             self.fail("The store database is temporarily unavailable.", 500)
 
     def do_DELETE(self):
@@ -521,7 +626,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.fail("Endpoint not found.", 404); return
                 if cur.rowcount == 0: self.fail("Item not found.", 404)
                 else: self.json({"ok": True})
-        except sqlite3.IntegrityError:
+        except DB_INTEGRITY_ERRORS:
             self.fail("This item is in use and cannot be removed.")
 
     def lookup_order(self, data: dict) -> None:
@@ -675,12 +780,28 @@ class Handler(BaseHTTPRequestHandler):
         if not match: raise ValueError("Choose a JPG, PNG, WebP or GIF image.")
         try: image = base64.b64decode(match.group(2), validate=True)
         except ValueError: raise ValueError("That image could not be read.")
-        if not image or len(image) > 5 * 1024 * 1024: raise ValueError("Images must be smaller than 5 MB.")
+        max_image_bytes = 3 * 1024 * 1024 if os.environ.get("VERCEL") == "1" else 5 * 1024 * 1024
+        if not image or len(image) > max_image_bytes:
+            raise ValueError(f"Images must be smaller than {max_image_bytes // (1024 * 1024)} MB.")
         kind = match.group(1)
         signatures = {"jpeg": image.startswith(b"\xff\xd8\xff"), "png": image.startswith(b"\x89PNG\r\n\x1a\n"), "gif": image.startswith((b"GIF87a", b"GIF89a")), "webp": image.startswith(b"RIFF") and image[8:12] == b"WEBP"}
         if not signatures[kind]: raise ValueError("That file does not look like the selected image type.")
         extension = "jpg" if kind == "jpeg" else kind
         name = f"{uuid.uuid4().hex}.{extension}"
+        if os.environ.get("BLOB_READ_WRITE_TOKEN"):
+            try:
+                from vercel.blob import BlobClient
+                blob = BlobClient().put(f"products/{name}", image, access="public", content_type=f"image/{kind}", add_random_suffix=False)
+                url = blob.get("url") if isinstance(blob, dict) else getattr(blob, "url", None)
+            except Exception as exc:
+                sys.stderr.write(f"AMORA image upload failed ({type(exc).__name__}).\n")
+                raise ValueError("The product photo could not be saved to Vercel Blob. Please try again.") from None
+            if not isinstance(url, str) or not url.startswith("https://"):
+                raise ValueError("The product photo service returned an invalid URL.")
+            self.json({"url": url}, 201)
+            return
+        if os.environ.get("VERCEL") == "1":
+            raise ValueError("Product photo storage is not configured. Add a Vercel Blob store to this project first.")
         (UPLOAD_DIR / name).write_bytes(image)
         self.json({"url": f"/uploads/{name}"}, 201)
 
@@ -688,7 +809,7 @@ class Handler(BaseHTTPRequestHandler):
 def setup_admin() -> None:
     import getpass
     init_db()
-    print("Create the private AMORA MART admin login. This password is stored as a salted hash in the local database.")
+    print("Create the private AMORA MART admin login. The password is stored as a salted hash in the configured database.")
     username = input("Admin username [admin]: ").strip() or "admin"
     if len(username) > 120: print("Username is too long."); raise SystemExit(2)
     first = getpass.getpass("Admin password (at least 12 characters): ")

@@ -1,6 +1,8 @@
 # AMORA MART
 
-A mobile-first reseller storefront with a private owner dashboard. Orders and catalogue data are saved in a local SQLite database. Supplier fulfilment is manual: use the admin copy buttons, place the corresponding supplier order yourself, then update its status here.
+A mobile-first reseller storefront with a private owner dashboard. On a computer, it uses SQLite locally; on Vercel, it connects to a persistent Turso database. Supplier fulfilment is manual: use the admin copy buttons, place the corresponding supplier order yourself, then update its status here.
+
+The customer-facing entry page and branded not-found page are in `public/index.html` and `public/404.html`. The Python app serves the storefront, admin route, and API; customer records and admin controls remain behind the authenticated backend.
 
 ## Run it on your computer
 
@@ -41,9 +43,13 @@ The other starter listings are marked **Demo sample** in the shop and in Admin �
 
 ## Before publishing publicly
 
-This project runs locally by default and is **not deployed to a public domain**. For a public shop, connect a domain and HTTPS hosting, use a production Python application server behind a TLS reverse proxy, restrict host access, configure secure database and photo backups, and set `AMORA_COOKIE_SECURE=1`. Set `AMORA_PUBLIC_URL` to the final HTTPS origin for sitemap URLs.
+This project includes a Vercel configuration. The Python API and `/admin` login work only when the full project folder is deployed, a persistent Turso database is connected, and the initial admin is created. Static HTML hosting by itself cannot save orders or authenticate an admin.
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for the prepared Docker/Waitress/Caddy deployment scaffold and the domain/VPS setup steps. The public setup uses Waitress behind Caddy; the simple standard-library server is only used for the local preview. Complete the deployment checks and replace the placeholder policies/contact information before taking real orders.
+Follow [VERCEL-SETUP.md](VERCEL-SETUP.md) to configure Vercel, connect the permanent database, create your private admin login in the browser, and enable photo uploads.
+
+Vercel's Python runtime deploys functions from `api/`; this project routes `/api/*` to that function. Vercel function files do not provide durable local SQLite storage, so product, order, settings, session, and admin data use Turso. Product photos use Blob storage. Uploaded images are public product content; customer order details stay in the database. The live site will not work until the environment variables are added and the database has been initialized with the setup file.
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the alternative Docker/Waitress/Caddy deployment scaffold. Complete the deployment steps and replace placeholder business and policy information before taking real customer orders.
 
 Add your legal business name, contact email/phone, return address, and final shipping/return/privacy/terms text before taking real orders. Policy pages currently contain editable starter language and an owner reminder.
 
@@ -53,5 +59,5 @@ There is no SMS or email provider connected. My Orders works in the placing brow
 
 ## Product management
 
-In Admin → Products, add the title, category, description, prices, internal supplier cost, stock state, variants, specifications, and product photos. Image uploads accept JPG, PNG, WebP, and GIF up to 5 MB each. Supplier cost and margin are only returned to the authenticated admin and never shown to shoppers.
+In Admin → Products, add the title, category, description, prices, internal supplier cost, stock state, variants, specifications, and product photos. Vercel uploads accept JPG, PNG, WebP, and GIF up to 3 MB each through Vercel Blob. Supplier cost and margin are only returned to the authenticated admin and never shown to shoppers.
 
